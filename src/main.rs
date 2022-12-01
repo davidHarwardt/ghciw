@@ -1,4 +1,4 @@
-use std::{process::{Command, Stdio, ChildStdin}, io::prelude::*, sync::mpsc, path::Path, time::Duration};
+use std::{process::{Command, Stdio, ChildStdin}, io::prelude::*, sync::mpsc, path::Path, time::Duration, collections::HashSet};
 
 use clap::Parser;
 use notify::{Watcher, RecursiveMode, Config, event::EventKind};
@@ -11,13 +11,14 @@ enum Msg {
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short)]
-    watch_path: String,
+    watch_path: Option<String>,
 
     #[arg(short, long, default_value = "50")]
     interval: u64,
 }
 
 fn reload(path: &str, msg_tx: &mpsc::Sender<Msg>) {
+    // println!("----- reload '{path}' -----");
     let msg = format!(":l {}\n", path);
     msg_tx.send(Msg::WriteDisplay(msg.into_bytes())).unwrap();
 
@@ -51,7 +52,9 @@ fn main() {
         let (msg_tx, msg_rx) = mpsc::channel();
         let msg_loop_tx = msg_tx.clone();
 
-        reload(&args.watch_path, &msg_tx);
+        args.watch_path.as_ref().map(|path| {
+            reload(path, &msg_tx);
+        });
 
         // read_loop
         s.spawn(move || {
@@ -69,32 +72,21 @@ fn main() {
             }
         });
 
-        // write_loop
-        s.spawn(move || {
-            let mut ghc_stdin: ChildStdin = ghc_rx.recv().unwrap();
-
-            while let Ok(v) = msg_rx.recv() {
-                match v {
-                    Msg::Write(data) => {
-                        ghc_stdin.write(&data[..]).unwrap();
-                    },
-                    Msg::WriteDisplay(data) => {
-                        std::thread::sleep(Duration::from_millis(100));
-                        ghc_stdin.write(&data[..]).unwrap();
-                        print!("{}", String::from_utf8(data).unwrap_or(format!("<invalid utf-8>")));
-                    },
-                }
-            }
-        });
 
         // watch loop
-        let path = args.watch_path.clone();
+        // let path = args.watch_path.clone();
         let mut watcher = notify::PollWatcher::new(move |res: Result<notify::Event, notify::Error>| {
             match res {
                 Ok(ev) => {
+                    let paths = ev.paths;
                     match ev.kind {
                         EventKind::Modify(_) => {
-                            reload(&path, &msg_tx);
+                            for path in paths {
+                                path.to_str().map(|path| {
+                                    reload(path, &msg_tx);
+                                });
+                            }
+                            // reload(&path, &msg_tx);
                         },
                         _ => {
 
@@ -105,7 +97,48 @@ fn main() {
             }
         }, Config::default().with_poll_interval(Duration::from_millis(args.interval))).unwrap();
 
-        watcher.watch(Path::new(&args.watch_path), RecursiveMode::Recursive).expect("could not find file to watch");
+        let mut watched = HashSet::new();
+        args.watch_path.as_ref().map(|path| {
+            watcher.watch(Path::new(path), RecursiveMode::Recursive).expect("could not find file to watch");
+            watched.insert(path.clone());
+        });
+
+        // write_loop
+        s.spawn(move || {
+            let mut ghc_stdin: ChildStdin = ghc_rx.recv().unwrap();
+
+            while let Ok(v) = msg_rx.recv() {
+                match v {
+                    Msg::Write(data) => {
+                        ghc_stdin.write(&data[..]).unwrap();
+
+                        if let Ok(str) = String::from_utf8(data) {
+                            let load_str = ":l";
+                            let unload_str = ":u";
+
+                            if str.starts_with(load_str) {
+                                let file = &str[load_str.len()..].trim();
+                                // println!("load file: {file}");
+                                if !watched.contains(*file) {
+                                    watched.insert(file.to_string());
+                                    watcher.watch(Path::new(file), RecursiveMode::NonRecursive).expect("could not find file to watch");
+                                }
+                            } else if str.starts_with(unload_str) {
+                                let file = &str[unload_str.len()..].trim();
+                                // println!("unload file: {file}");
+                                watched.remove(*file);
+                                watcher.unwatch(&Path::new(file)).expect("could not unwatch the file");
+                            }
+                        }
+                    },
+                    Msg::WriteDisplay(data) => {
+                        std::thread::sleep(Duration::from_millis(100));
+                        ghc_stdin.write(&data[..]).unwrap();
+                        print!("{}", String::from_utf8(data).unwrap_or(format!("<invalid utf-8>")));
+                    },
+                }
+            }
+        });
 
         let mut cmd = Command::new("ghci")
             // .args([""])
